@@ -28,12 +28,12 @@ class SimSiam(nn.Module):
         self.encoder.fc = nn.Sequential(nn.Linear(prev_dim, prev_dim, bias=False),
                                         nn.BatchNorm1d(prev_dim),
                                         nn.ReLU(inplace=True), # first layer
-                                        nn.Linear(prev_dim, prev_dim, bias=False),
-                                        nn.BatchNorm1d(prev_dim),
-                                        nn.ReLU(inplace=True), # second layer
+                                        # nn.Linear(prev_dim, prev_dim, bias=False),
+                                        # nn.BatchNorm1d(prev_dim),
+                                        # nn.ReLU(inplace=True), # second layer
                                         self.encoder.fc,
                                         nn.BatchNorm1d(dim, affine=False)) # output layer
-        self.encoder.fc[6].bias.requires_grad = False # hack: not use bias as it is followed by BN
+        self.encoder.fc[-2].bias.requires_grad = False # hack: not use bias as it is followed by BN
 
         # build a 2-layer predictor
         self.predictor = nn.Sequential(nn.Linear(dim, pred_dim, bias=False),
@@ -59,3 +59,15 @@ class SimSiam(nn.Module):
         p2 = self.predictor(z2) # NxC
 
         return p1, p2, z1.detach(), z2.detach()
+
+
+class SimSiamEncoder(nn.Module):
+    """
+    SimSiam feature extractor.
+    """
+    def __init__(self, encoder):
+        super(SimSiamEncoder, self).__init__()
+        self.encoder = encoder
+
+    def forward(self, x):
+        return self.encoder(x)
