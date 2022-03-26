@@ -29,14 +29,15 @@ import torchvision.models as models
 
 import simsiam.loader
 import simsiam.builder
+import simsiam.resnet
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR',
-                    help='path to dataset')
+# parser.add_argument('data', metavar='DIR',
+#                     help='path to dataset')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                     choices=model_names,
                     help='model architecture: ' +
@@ -82,6 +83,11 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
 
+parser.add_argument('--eval-period', default=10, type=int,
+                    help='Evaluation period')
+parser.add_argument('--checkpoint-dir', default='checkpoints',
+                    help='Checkpoint directory')
+
 # simsiam specific configs:
 parser.add_argument('--dim', default=2048, type=int,
                     help='feature dimension (default: 2048)')
@@ -92,6 +98,9 @@ parser.add_argument('--fix-pred-lr', action='store_true',
 
 def main():
     args = parser.parse_args()
+
+    args.run_dir = os.path.join(args.checkpoint_dir, time.strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(args.run_dir, exist_ok=True)
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -113,6 +122,7 @@ def main():
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
 
     ngpus_per_node = torch.cuda.device_count()
+    args.ngpus_per_node = ngpus_per_node
     if args.multiprocessing_distributed:
         # Since we have ngpus_per_node processes per node, the total world_size
         # needs to be adjusted accordingly
@@ -130,7 +140,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # suppress printing if not master
     if args.multiprocessing_distributed and args.gpu != 0:
-        def print_pass(*args):
+        def print_pass(*args, **kwargs):
             pass
         builtins.print = print_pass
 
@@ -150,8 +160,10 @@ def main_worker(gpu, ngpus_per_node, args):
     # create model
     print("=> creating model '{}'".format(args.arch))
     model = simsiam.builder.SimSiam(
-        models.__dict__[args.arch],
+        # models.__dict__[args.arch],
+        simsiam.resnet.ResNet18,
         args.dim, args.pred_dim)
+    encoder = simsiam.builder.SimSiamEncoder(model.encoder)
 
     # infer learning rate before changing batch size
     init_lr = args.lr * args.batch_size / 256
@@ -171,28 +183,36 @@ def main_worker(gpu, ngpus_per_node, args):
             args.batch_size = int(args.batch_size / ngpus_per_node)
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+            encoder = torch.nn.parallel.DistributedDataParallel(encoder, device_ids=[args.gpu])
         else:
             model.cuda()
             # DistributedDataParallel will divide and allocate batch_size to all
             # available GPUs if device_ids are not set
             model = torch.nn.parallel.DistributedDataParallel(model)
+            encoder = torch.nn.parallel.DistributedDataParallel(encoder)
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
+        encoder = encoder.cuda(args.gpu)
         # comment out the following line for debugging
-        raise NotImplementedError("Only DistributedDataParallel is supported.")
+        # raise NotImplementedError("Only DistributedDataParallel is supported.")
     else:
         # AllGather implementation (batch shuffle, queue update, etc.) in
         # this code only supports DistributedDataParallel.
-        raise NotImplementedError("Only DistributedDataParallel is supported.")
+        # raise NotImplementedError("Only DistributedDataParallel is supported.")
+        pass
     print(model) # print model after SyncBatchNorm
 
     # define loss function (criterion) and optimizer
     criterion = nn.CosineSimilarity(dim=1).cuda(args.gpu)
 
     if args.fix_pred_lr:
-        optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False},
-                        {'params': model.module.predictor.parameters(), 'fix_lr': True}]
+        if args.distributed:
+            optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False},
+                            {'params': model.module.predictor.parameters(), 'fix_lr': True}]
+        else:
+            optim_params = [{'params': model.encoder.parameters(), 'fix_lr': False},
+                            {'params': model.predictor.parameters(), 'fix_lr': True}]
     else:
         optim_params = model.parameters()
 
@@ -221,35 +241,53 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+    # traindir = os.path.join(args.data, 'train')
+    normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+                                     std=[0.2023, 0.1994, 0.2010])
 
     # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
     augmentation = [
-        transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
+        transforms.RandomResizedCrop(32), # scale=(0.2, 1.)),
         transforms.RandomApply([
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
         ], p=0.8),
         transforms.RandomGrayscale(p=0.2),
-        transforms.RandomApply([simsiam.loader.GaussianBlur([.1, 2.])], p=0.5),
+        # transforms.RandomApply([simsiam.loader.GaussianBlur([.1, 2.])], p=0.5),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         normalize
     ]
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        simsiam.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010])])
+
+    train_dataset = datasets.CIFAR10(root='./data', train=True,
+                                     transform=simsiam.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+
+    train_knn_dataset = datasets.CIFAR10(root='./data', train=True, transform=test_transform)
+    test_dataset = datasets.CIFAR10(root='./data', train=False, transform=test_transform)
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        train_knn_sampler = torch.utils.data.distributed.DistributedSampler(train_knn_dataset)
+        test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset)
     else:
         train_sampler = None
+        train_knn_sampler = None
+        test_sampler = None
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
+
+    train_knn_loader = torch.utils.data.DataLoader(
+        train_knn_dataset, batch_size=args.batch_size, shuffle=(train_knn_sampler is None),
+        num_workers=4, pin_memory=True, sampler=train_knn_sampler, drop_last=False)
+
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=args.batch_size, shuffle=(test_sampler is None),
+        num_workers=4, pin_memory=True, sampler=test_sampler, drop_last=False)
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -257,16 +295,20 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, init_lr, epoch, args)
 
         # train for one epoch
+        # test(train_knn_loader, test_loader, encoder, epoch, args)
         train(train_loader, model, criterion, optimizer, epoch, args)
 
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': model.state_dict(),
-                'optimizer' : optimizer.state_dict(),
-            }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(epoch))
+        if epoch > 0 and epoch % args.eval_period == 0:
+            accu = test(train_knn_loader, test_loader, encoder, epoch, args)
+
+            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                    and args.rank % ngpus_per_node == 0):
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.state_dict(),
+                    'optimizer' : optimizer.state_dict(),
+                }, is_best=False, filename='{}/checkpoint_{:04d}_{:.2f}.pth.tar'.format(args.run_dir, epoch, accu))
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -309,6 +351,89 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             progress.display(i)
 
 
+def get_features(loader, encoder, args):
+    batch_time = AverageMeter('Time', ':6.3f')
+    data_time = AverageMeter('Data', ':6.3f')
+    progress = ProgressMeter(
+        len(loader),
+        [batch_time, data_time])
+
+    # switch to train mode
+    encoder.eval()
+
+    num = 0
+    features, labels = [], []
+
+    end = time.time()
+    for i, (images, y) in enumerate(loader):
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        if args.gpu is not None:
+            images = images.cuda(args.gpu, non_blocking=True)
+            y = y.cuda(args.gpu, non_blocking=True)
+
+        # compute output
+        z1 = encoder(images)
+        features.append(z1); labels.append(y)
+        num += len(z1)
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            progress.display(i, end='\r')
+
+    features = torch.cat(features)
+    labels = torch.cat(labels)
+    if args.multiprocessing_distributed:
+        all_features = [torch.zeros_like(features) for _ in range(args.world_size)]
+        dist.all_gather(all_features, features)
+        features = torch.cat(all_features, dim=0)
+
+        all_labels = [torch.zeros_like(labels) for _ in range(args.world_size)]
+        dist.all_gather(all_labels, labels)
+        labels = torch.cat(all_labels, dim=0)
+
+    return features, labels
+
+
+def test(train_knn_loader, test_loader, encoder, epoch, args, k=200):
+
+    with torch.no_grad():
+        # Compute features
+        train_features, train_labels = get_features(train_knn_loader, encoder, args)
+        test_features, test_labels = get_features(test_loader, encoder, args)
+
+        if (args.multiprocessing_distributed and args.rank % args.ngpus_per_node != 0):
+            return None
+
+        # KNN classifier
+        similarity = torch.mm(test_features, train_features.T)
+        _, inds = similarity.topk(k, dim=1)
+        predicted, _ = train_labels[inds].mode(dim=1)
+
+        # Compute per-class accuracy
+        match = predicted.eq(test_labels).int()
+
+    cls_total, cls_correct = {'all': 0}, {'all': 0}
+    for m, l in zip(match, test_labels):
+        l, m = l.item(), m.item()
+        if cls_total.get(l, None) is None:
+            cls_total[l] = 0; cls_correct[l] = 0
+        cls_total[l] += 1; cls_total['all'] += 1
+        cls_correct[l] += m; cls_correct['all'] += m
+    for cls in cls_total.keys():
+        if cls == 'all': continue
+        correct, total = cls_correct[cls], cls_total[cls]
+        print(f'{cls}: {correct/total} ({correct}/{total})', end='; ')
+    correct, total = cls_correct['all'], cls_total['all']
+    accu = correct/total
+    print(f'\nAVG: {accu:.4f} ({correct}/{total})')
+    return accu
+
+
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
@@ -345,10 +470,13 @@ class ProgressMeter(object):
         self.meters = meters
         self.prefix = prefix
 
-    def display(self, batch):
+    def display(self, batch, end=None):
         entries = [self.prefix + self.batch_fmtstr.format(batch)]
         entries += [str(meter) for meter in self.meters]
-        print('\t'.join(entries))
+        if end is not None:
+            print('\t'.join(entries), end=end)
+        else:
+            print('\t'.join(entries))
 
     def _get_batch_fmtstr(self, num_batches):
         num_digits = len(str(num_batches // 1))
