@@ -31,6 +31,8 @@ import simsiam.loader
 import simsiam.builder
 import simsiam.resnet
 
+from utils import plot_images
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
@@ -87,6 +89,8 @@ parser.add_argument('--eval-period', default=10, type=int,
                     help='Evaluation period')
 parser.add_argument('--checkpoint-dir', default='checkpoints',
                     help='Checkpoint directory')
+parser.add_argument('--sup-simsiam-mode', default=None, choices=['non-contrastive', 'reg', 'correlation'],
+                    help='Supervised SimSiam mode')
 
 # simsiam specific configs:
 parser.add_argument('--dim', default=2048, type=int,
@@ -242,12 +246,13 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # Data loading code
     # traindir = os.path.join(args.data, 'train')
-    normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
-                                     std=[0.2023, 0.1994, 0.2010])
+    mean, std = [0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010]
+    # mean, std = [0., 0., 0.], [1., 1., 1.]
+    normalize = transforms.Normalize(mean=mean, std=std)
 
     # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
     augmentation = [
-        transforms.RandomResizedCrop(32), # scale=(0.2, 1.)),
+        transforms.RandomResizedCrop(32, scale=(0.2, 1.)),
         transforms.RandomApply([
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
         ], p=0.8),
@@ -258,12 +263,23 @@ def main_worker(gpu, ngpus_per_node, args):
         normalize
     ]
 
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)])
+
     test_transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010])])
+        transforms.Normalize(mean, std)])
 
-    train_dataset = datasets.CIFAR10(root='./data', train=True,
-                                     transform=simsiam.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+    if args.sup_simsiam_mode == 'non-contrastive':
+        dset = datasets.CIFAR10(root='./data', train=True, transform=train_transform)
+        train_dataset = simsiam.loader.SupervisedSimSiamDataset(dset)
+    elif args.sup_simsiam_mode is None:
+        train_dataset = datasets.CIFAR10(root='./data', train=True,
+                                         transform=simsiam.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+    else:
+        raise Exception(f'Mode: {args.sup_simsiam_mode} is not supported.')
 
     train_knn_dataset = datasets.CIFAR10(root='./data', train=True, transform=test_transform)
     test_dataset = datasets.CIFAR10(root='./data', train=False, transform=test_transform)
@@ -331,6 +347,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         if args.gpu is not None:
             images[0] = images[0].cuda(args.gpu, non_blocking=True)
             images[1] = images[1].cuda(args.gpu, non_blocking=True)
+
+        # plot_images(images[0], images[1])
 
         # compute output and loss
         p1, p2, z1, z2 = model(x1=images[0], x2=images[1])
