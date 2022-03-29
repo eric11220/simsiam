@@ -325,7 +325,7 @@ def main_worker(gpu, ngpus_per_node, args):
         # train for one epoch
         niter = train(train_loader, model, criterion, optimizer, epoch, niter, args)
 
-        if epoch > 0 and epoch % args.eval_period == 0:
+        if (epoch > 0 and epoch % args.eval_period == 0) or epoch == args.epochs-1:
             accu = test(train_knn_loader, test_loader, encoder, epoch, args)
 
             if not args.multiprocessing_distributed or (args.multiprocessing_distributed
