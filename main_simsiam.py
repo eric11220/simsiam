@@ -32,78 +32,88 @@ import simsiam.builder
 import simsiam.resnet
 
 from utils import plot_images
+from meter import AverageMeter, ProgressMeter
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
 
-parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-# parser.add_argument('data', metavar='DIR',
-#                     help='path to dataset')
-parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
-                    choices=model_names,
-                    help='model architecture: ' +
-                        ' | '.join(model_names) +
-                        ' (default: resnet50)')
-parser.add_argument('-j', '--workers', default=32, type=int, metavar='N',
-                    help='number of data loading workers (default: 32)')
-parser.add_argument('--epochs', default=100, type=int, metavar='N',
-                    help='number of total epochs to run')
-parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
-                    help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=512, type=int,
-                    metavar='N',
-                    help='mini-batch size (default: 512), this is the total '
-                         'batch size of all GPUs on the current node when '
-                         'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--lr', '--learning-rate', default=0.05, type=float,
-                    metavar='LR', help='initial (base) learning rate', dest='lr')
-parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
-                    help='momentum of SGD solver')
-parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
-                    metavar='W', help='weight decay (default: 1e-4)',
-                    dest='weight_decay')
-parser.add_argument('-p', '--print-freq', default=10, type=int,
-                    metavar='N', help='print frequency (default: 10)')
-parser.add_argument('--resume', default='', type=str, metavar='PATH',
-                    help='path to latest checkpoint (default: none)')
-parser.add_argument('--world-size', default=-1, type=int,
-                    help='number of nodes for distributed training')
-parser.add_argument('--rank', default=-1, type=int,
-                    help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
-                    help='url used to set up distributed training')
-parser.add_argument('--dist-backend', default='nccl', type=str,
-                    help='distributed backend')
-parser.add_argument('--seed', default=None, type=int,
-                    help='seed for initializing training. ')
-parser.add_argument('--gpu', default=None, type=int,
-                    help='GPU id to use.')
-parser.add_argument('--multiprocessing-distributed', action='store_true',
-                    help='Use multi-processing distributed training to launch '
-                         'N processes per node, which has N GPUs. This is the '
-                         'fastest way to use PyTorch for either single node or '
-                         'multi node data parallel training')
+def arguments():
+    parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
+    # parser.add_argument('data', metavar='DIR',
+    #                     help='path to dataset')
+    parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
+                        choices=model_names,
+                        help='model architecture: ' +
+                            ' | '.join(model_names) +
+                            ' (default: resnet50)')
+    parser.add_argument('-j', '--workers', default=32, type=int, metavar='N',
+                        help='number of data loading workers (default: 32)')
+    parser.add_argument('--epochs', default=100, type=int, metavar='N',
+                        help='number of total epochs to run')
+    parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
+                        help='manual epoch number (useful on restarts)')
+    parser.add_argument('-b', '--batch-size', default=512, type=int,
+                        metavar='N',
+                        help='mini-batch size (default: 512), this is the total '
+                             'batch size of all GPUs on the current node when '
+                             'using Data Parallel or Distributed Data Parallel')
+    parser.add_argument('--lr', '--learning-rate', default=0.05, type=float,
+                        metavar='LR', help='initial (base) learning rate', dest='lr')
+    parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
+                        help='momentum of SGD solver')
+    parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
+                        metavar='W', help='weight decay (default: 1e-4)',
+                        dest='weight_decay')
+    parser.add_argument('-p', '--print-freq', default=10, type=int,
+                        metavar='N', help='print frequency (default: 10)')
+    parser.add_argument('--resume', default='', type=str, metavar='PATH',
+                        help='path to latest checkpoint (default: none)')
+    parser.add_argument('--world-size', default=-1, type=int,
+                        help='number of nodes for distributed training')
+    parser.add_argument('--rank', default=-1, type=int,
+                        help='node rank for distributed training')
+    parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+                        help='url used to set up distributed training')
+    parser.add_argument('--dist-backend', default='nccl', type=str,
+                        help='distributed backend')
+    parser.add_argument('--seed', default=None, type=int,
+                        help='seed for initializing training. ')
+    parser.add_argument('--gpu', default=None, type=int,
+                        help='GPU id to use.')
+    parser.add_argument('--multiprocessing-distributed', action='store_true',
+                        help='Use multi-processing distributed training to launch '
+                             'N processes per node, which has N GPUs. This is the '
+                             'fastest way to use PyTorch for either single node or '
+                             'multi node data parallel training')
 
-parser.add_argument('--eval-period', default=10, type=int,
-                    help='Evaluation period')
-parser.add_argument('--checkpoint-dir', default='checkpoints',
-                    help='Checkpoint directory')
-parser.add_argument('--sup-simsiam-mode', default=None, choices=['non-contrastive', 'reg', 'correlation'],
-                    help='Supervised SimSiam mode')
+    parser.add_argument('--eval-period', default=10, type=int,
+                        help='Evaluation period')
+    parser.add_argument('--checkpoint-dir', default='checkpoints',
+                        help='Checkpoint directory')
+    parser.add_argument('--supervised', action='store_true',
+                        help='Leverage supervised information')
+    parser.add_argument('--predictor-reg', default=None, choices=['corr'],
+                        help='Predictor regularization')
+    parser.add_argument('--strong-aug', action='store_true',
+                        help='Apply the same augmentation as in the SSL case')
+    parser.add_argument('--exp-name', default=None,
+                        help='Experiment name')
 
-# simsiam specific configs:
-parser.add_argument('--dim', default=2048, type=int,
-                    help='feature dimension (default: 2048)')
-parser.add_argument('--pred-dim', default=512, type=int,
-                    help='hidden dimension of the predictor (default: 512)')
-parser.add_argument('--fix-pred-lr', action='store_true',
-                    help='Fix learning rate for the predictor')
+    # simsiam specific configs:
+    parser.add_argument('--dim', default=2048, type=int,
+                        help='feature dimension (default: 2048)')
+    parser.add_argument('--pred-dim', default=512, type=int,
+                        help='hidden dimension of the predictor (default: 512)')
+    parser.add_argument('--fix-pred-lr', action='store_true',
+                        help='Fix learning rate for the predictor')
+    return parser
 
 def main():
-    args = parser.parse_args()
+    args = arguments().parse_args()
 
-    args.run_dir = os.path.join(args.checkpoint_dir, time.strftime("%Y%m%d_%H%M%S"))
+    args.run_dir = os.path.join(args.checkpoint_dir,
+                                args.exp_name if args.exp_name is not None else time.strftime("%Y%m%d_%H%M%S"))
     os.makedirs(args.run_dir, exist_ok=True)
 
     if args.seed is not None:
@@ -166,7 +176,7 @@ def main_worker(gpu, ngpus_per_node, args):
     model = simsiam.builder.SimSiam(
         # models.__dict__[args.arch],
         simsiam.resnet.ResNet18,
-        args.dim, args.pred_dim)
+        args.dim, args.pred_dim, predictor_reg=args.predictor_reg)
     encoder = simsiam.builder.SimSiamEncoder(model.encoder)
 
     # infer learning rate before changing batch size
@@ -263,23 +273,24 @@ def main_worker(gpu, ngpus_per_node, args):
         normalize
     ]
 
-    train_transform = transforms.Compose([
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std)])
+    if args.strong_aug:
+        train_transform = transforms.Compose(augmentation)
+    else:
+        train_transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std)])
 
     test_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean, std)])
 
-    if args.sup_simsiam_mode == 'non-contrastive':
+    if args.supervised:
         dset = datasets.CIFAR10(root='./data', train=True, transform=train_transform)
         train_dataset = simsiam.loader.SupervisedSimSiamDataset(dset)
-    elif args.sup_simsiam_mode is None:
+    else:
         train_dataset = datasets.CIFAR10(root='./data', train=True,
                                          transform=simsiam.loader.TwoCropsTransform(transforms.Compose(augmentation)))
-    else:
-        raise Exception(f'Mode: {args.sup_simsiam_mode} is not supported.')
 
     train_knn_dataset = datasets.CIFAR10(root='./data', train=True, transform=test_transform)
     test_dataset = datasets.CIFAR10(root='./data', train=False, transform=test_transform)
@@ -305,14 +316,14 @@ def main_worker(gpu, ngpus_per_node, args):
         test_dataset, batch_size=args.batch_size, shuffle=(test_sampler is None),
         num_workers=4, pin_memory=True, sampler=test_sampler, drop_last=False)
 
+    niter = 0
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, init_lr, epoch, args)
 
         # train for one epoch
-        # test(train_knn_loader, test_loader, encoder, epoch, args)
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        niter = train(train_loader, model, criterion, optimizer, epoch, niter, args)
 
         if epoch > 0 and epoch % args.eval_period == 0:
             accu = test(train_knn_loader, test_loader, encoder, epoch, args)
@@ -327,7 +338,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 }, is_best=False, filename='{}/checkpoint_{:04d}_{:.2f}.pth.tar'.format(args.run_dir, epoch, accu))
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, epoch, niter, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4f')
@@ -352,6 +363,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         # compute output and loss
         p1, p2, z1, z2 = model(x1=images[0], x2=images[1])
+        model.update(z1, z2)
         loss = -(criterion(p1, z2).mean() + criterion(p2, z1).mean()) * 0.5
 
         losses.update(loss.item(), images[0].size(0))
@@ -361,12 +373,17 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         loss.backward()
         optimizer.step()
 
+        model.regulate_predictor(niter, epoch_start=False)
+
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
         if i % args.print_freq == 0:
             progress.display(i)
+        niter += 1
+
+    return niter
 
 
 def get_features(loader, encoder, args):
@@ -414,12 +431,14 @@ def get_features(loader, encoder, args):
         dist.all_gather(all_labels, labels)
         labels = torch.cat(all_labels, dim=0)
 
+    features = features / features.norm(dim=-1, keepdim=True)
     return features, labels
 
 
-def test(train_knn_loader, test_loader, encoder, epoch, args, k=200):
-
+def test(train_knn_loader, test_loader, encoder, epoch, args, knn_k=200, knn_t=0.1):
     with torch.no_grad():
+        classes = len(train_knn_loader.dataset.classes)
+
         # Compute features
         train_features, train_labels = get_features(train_knn_loader, encoder, args)
         test_features, test_labels = get_features(test_loader, encoder, args)
@@ -428,12 +447,20 @@ def test(train_knn_loader, test_loader, encoder, epoch, args, k=200):
             return None
 
         # KNN classifier
-        similarity = torch.mm(test_features, train_features.T)
-        _, inds = similarity.topk(k, dim=1)
-        predicted, _ = train_labels[inds].mode(dim=1)
+        # compute cos similarity between each feature vector and feature bank ---> [B, N]
+        sim_matrix = torch.mm(test_features, train_features.T)
+        sim_weight, sim_indices = sim_matrix.topk(k=knn_k, dim=-1)
+        sim_labels = torch.gather(train_labels.expand(test_features.size(0), -1), dim=-1, index=sim_indices)
+        sim_weight = (sim_weight / knn_t).exp()
+
+        # counts for each class
+        one_hot_label = torch.zeros(test_features.size(0) * knn_k, classes, device=sim_labels.device)
+        one_hot_label = one_hot_label.scatter(dim=-1, index=sim_labels.view(-1, 1), value=1.0)
+        pred_scores = torch.sum(one_hot_label.view(test_features.size(0), -1, classes) * sim_weight.unsqueeze(dim=-1), dim=1)
+        predicted = pred_scores.argsort(dim=-1, descending=True)
 
         # Compute per-class accuracy
-        match = predicted.eq(test_labels).int()
+        match = predicted[:,0].eq(test_labels).int()
 
     cls_total, cls_correct = {'all': 0}, {'all': 0}
     for m, l in zip(match, test_labels):
@@ -456,50 +483,6 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, 'model_best.pth.tar')
-
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self, name, fmt=':f'):
-        self.name = name
-        self.fmt = fmt
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-    def __str__(self):
-        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
-        return fmtstr.format(**self.__dict__)
-
-
-class ProgressMeter(object):
-    def __init__(self, num_batches, meters, prefix=""):
-        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
-        self.meters = meters
-        self.prefix = prefix
-
-    def display(self, batch, end=None):
-        entries = [self.prefix + self.batch_fmtstr.format(batch)]
-        entries += [str(meter) for meter in self.meters]
-        if end is not None:
-            print('\t'.join(entries), end=end)
-        else:
-            print('\t'.join(entries))
-
-    def _get_batch_fmtstr(self, num_batches):
-        num_digits = len(str(num_batches // 1))
-        fmt = '{:' + str(num_digits) + 'd}'
-        return '[' + fmt + '/' + fmt.format(num_batches) + ']'
 
 
 def adjust_learning_rate(optimizer, init_lr, epoch, args):
