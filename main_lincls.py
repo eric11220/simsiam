@@ -27,14 +27,14 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 
+import simsiam.resnet
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR',
-                    help='path to dataset')
-parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
+parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     choices=model_names,
                     help='model architecture: ' +
                         ' | '.join(model_names) +
@@ -80,6 +80,10 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
+parser.add_argument('--save-period', default=-1, type=int,
+                    help='Checkpoint saving period')
+parser.add_argument('--eval-period', default=10, type=int,
+                    help='Evaluation period')
 
 # additional configs:
 parser.add_argument('--pretrained', default='', type=str,
@@ -150,7 +154,8 @@ def main_worker(gpu, ngpus_per_node, args):
         torch.distributed.barrier()
     # create model
     print("=> creating model '{}'".format(args.arch))
-    model = models.__dict__[args.arch]()
+    model = simsiam.resnet.ResNet18(10)
+    # model = models.__dict__[args.arch]()
 
     # freeze all layers but the last fc
     for name, param in model.named_parameters():
@@ -173,6 +178,8 @@ def main_worker(gpu, ngpus_per_node, args):
                 if k.startswith('module.encoder') and not k.startswith('module.encoder.fc'):
                     # remove prefix
                     state_dict[k[len("module.encoder."):]] = state_dict[k]
+                elif k.startswith('encoder') and not k.startswith('encoder.fc'):
+                    state_dict[k[len("encoder."):]] = state_dict[k]
                 # delete renamed or unused k
                 del state_dict[k]
 
@@ -256,15 +263,13 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+    mean, std = [0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010]
+    normalize = transforms.Normalize(mean=mean, std=std)
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224),
+    train_dataset = datasets.CIFAR10(
+        root='./data', train=True,
+        transform=transforms.Compose([
+            transforms.RandomResizedCrop(32),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize,
@@ -280,11 +285,11 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
+        datasets.CIFAR10(
+            root='./data', train=False,
+            transform=transforms.Compose([
+                transforms.ToTensor(),
+                normalize,
         ])),
         batch_size=256, shuffle=False,
         num_workers=args.workers, pin_memory=True)
@@ -302,23 +307,25 @@ def main_worker(gpu, ngpus_per_node, args):
         train(train_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        if (epoch > 0 and epoch % args.eval_period == 0) or epoch == args.epochs-1:
+            acc1 = validate(val_loader, model, criterion, args)
 
-        # remember best acc@1 and save checkpoint
-        is_best = acc1 > best_acc1
-        best_acc1 = max(acc1, best_acc1)
+            # remember best acc@1 and save checkpoint
+            is_best = acc1 > best_acc1
+            best_acc1 = max(acc1, best_acc1)
 
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': model.state_dict(),
-                'best_acc1': best_acc1,
-                'optimizer' : optimizer.state_dict(),
-            }, is_best)
-            if epoch == args.start_epoch:
-                sanity_check(model.state_dict(), args.pretrained)
+        if (epoch > 0 and args.save_period > 0 and epoch % args.save_period == 0) or epoch == args.epochs-1:
+            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                    and args.rank % ngpus_per_node == 0):
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.state_dict(),
+                    'best_acc1': best_acc1,
+                    'optimizer' : optimizer.state_dict(),
+                }, is_best)
+                if epoch == args.start_epoch:
+                    sanity_check(model.state_dict(), args.pretrained)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -438,8 +445,10 @@ def sanity_check(state_dict, pretrained_weights):
             continue
 
         # name in pretrained model
-        k_pre = 'module.encoder.' + k[len('module.'):] \
-            if k.startswith('module.') else 'module.encoder.' + k
+        # k_pre = 'module.encoder.' + k[len('module.'):] \
+        #     if k.startswith('module.') else 'module.encoder.' + k
+        k_pre = 'encoder.' + k[len('encoder.'):] \
+            if k.startswith('encoder.') else 'encoder.' + k
 
         assert ((state_dict[k].cpu() == state_dict_pre[k_pre]).all()), \
             '{} is changed in linear classifier training.'.format(k)
