@@ -19,7 +19,7 @@ class SimSiam(nn.Module):
     """
     Build a SimSiam model.
     """
-    def __init__(self, base_encoder, dim=2048, pred_dim=512, predictor_reg=None):
+    def __init__(self, base_encoder, dim=2048, pred_dim=512, predictor_reg=None, ema=0):
         """
         dim: feature dimension (default: 2048)
         pred_dim: hidden dimension of the predictor (default: 512)
@@ -32,19 +32,18 @@ class SimSiam(nn.Module):
 
         # build a 3-layer projector
         prev_dim = self.encoder.fc.weight.shape[1]
-        self.encoder.fc = nn.Sequential(nn.Linear(prev_dim, prev_dim, bias=False),
+        self.encoder.fc = nn.Sequential(nn.Linear(prev_dim, prev_dim, bias=True),
                                         nn.BatchNorm1d(prev_dim),
                                         nn.ReLU(inplace=True), # first layer
-                                        # nn.Linear(prev_dim, prev_dim, bias=False),
-                                        # nn.BatchNorm1d(prev_dim),
-                                        # nn.ReLU(inplace=True), # second layer
-                                        self.encoder.fc,
-                                        nn.BatchNorm1d(dim, affine=False)) # output layer
-        self.encoder.fc[-2].bias.requires_grad = False # hack: not use bias as it is followed by BN
+                                        nn.Linear(prev_dim, dim, bias=True))
+                                        # nn.BatchNorm1d(dim, affine=False)) # output layer
+        # self.encoder.fc[-2].bias.requires_grad = False # hack: not use bias as it is followed by BN
+        self.ema = ema
+        self.target_encoder = copy.deepcopy(self.encoder) if ema > 0 else self.encoder
 
         if predictor_reg is not None:
             # One-layer predictor for analytical solution
-            self.predictor = nn.Linear(dim, dim)
+            self.predictor = nn.Linear(dim, dim, bias=False)
         else:
             # build a 2-layer predictor
             self.predictor = nn.Sequential(nn.Linear(dim, pred_dim, bias=False),
@@ -78,8 +77,20 @@ class SimSiam(nn.Module):
         p1 = self.predictor(z1) # NxC
         p2 = self.predictor(z2) # NxC
 
+        if self.ema > 0:
+            z1 = self.target_encoder(x1)
+            z2 = self.target_encoder(x2)
+
         return p1, p2, z1.detach(), z2.detach()
 
+    @torch.no_grad()
+    def update_target_network_parameters(self):
+        """
+        Momentum update of the key encoder
+        """
+        if self.ema > 0:
+            for param_q, param_k in zip(self.encoder.parameters(), self.target_encoder.parameters()):
+                param_k.data = param_k.data * self.ema + param_q.data * (1. - self.ema)
 
     def _set_predictor_params(self):
         predictor_opt = {

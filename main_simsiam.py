@@ -95,6 +95,8 @@ def arguments():
                         help='Leverage supervised information')
     parser.add_argument('--predictor-reg', default=None, choices=['corr'],
                         help='Predictor regularization')
+    parser.add_argument('--ema', type=float, default=0,
+                        help='Momentum for the target encoder in SimSiam')
     parser.add_argument('--strong-aug', action='store_true',
                         help='Apply the same augmentation as in the SSL case')
     parser.add_argument('--exp-name', default=None,
@@ -176,7 +178,8 @@ def main_worker(gpu, ngpus_per_node, args):
     model = simsiam.builder.SimSiam(
         # models.__dict__[args.arch],
         simsiam.resnet.ResNet18,
-        args.dim, args.pred_dim, predictor_reg=args.predictor_reg)
+        args.dim, args.pred_dim,
+        predictor_reg=args.predictor_reg, ema=args.ema)
     encoder = simsiam.builder.SimSiamEncoder(model.encoder)
 
     # infer learning rate before changing batch size
@@ -374,6 +377,7 @@ def train(train_loader, model, criterion, optimizer, epoch, niter, args):
         optimizer.step()
 
         model.regulate_predictor(niter, epoch_start=False)
+        model.update_target_network_parameters()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -435,7 +439,7 @@ def get_features(loader, encoder, args):
     return features, labels
 
 
-def test(train_knn_loader, test_loader, encoder, epoch, args, knn_k=200, knn_t=0.1):
+def test(train_knn_loader, test_loader, encoder, epoch, args, knn_k=25, knn_t=0.1):
     with torch.no_grad():
         classes = len(train_knn_loader.dataset.classes)
 
