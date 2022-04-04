@@ -101,6 +101,8 @@ def arguments():
                         help='Apply the same augmentation as in the SSL case')
     parser.add_argument('--exp-name', default=None,
                         help='Experiment name')
+    parser.add_argument('--celoss-ratio', default=0., type=float,
+                        help='Cross entropy loss ratio to the pipeline')
 
     # simsiam specific configs:
     parser.add_argument('--dim', default=2048, type=int,
@@ -179,7 +181,7 @@ def main_worker(gpu, ngpus_per_node, args):
         # models.__dict__[args.arch],
         simsiam.resnet.ResNet18,
         args.dim, args.pred_dim,
-        predictor_reg=args.predictor_reg, ema=args.ema)
+        predictor_reg=args.predictor_reg, ema=args.ema, sup_branch=args.celoss_ratio>0)
     encoder = simsiam.builder.SimSiamEncoder(model.encoder)
 
     # infer learning rate before changing batch size
@@ -222,6 +224,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # define loss function (criterion) and optimizer
     criterion = nn.CosineSimilarity(dim=1).cuda(args.gpu)
+    sup_criterion = nn.CrossEntropyLoss()
 
     if args.fix_pred_lr:
         if args.distributed:
@@ -326,9 +329,10 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, init_lr, epoch, args)
 
         # train for one epoch
-        niter = train(train_loader, model, criterion, optimizer, epoch, niter, args)
+        niter = train(train_loader, model, criterion, sup_criterion, optimizer, epoch, niter, args)
 
         if (epoch > 0 and epoch % args.eval_period == 0) or epoch == args.epochs-1:
+            # accu = test(train_knn_loader, train_knn_loader, encoder, epoch, args)
             accu = test(train_knn_loader, test_loader, encoder, epoch, args)
 
             if not args.multiprocessing_distributed or (args.multiprocessing_distributed
@@ -341,20 +345,28 @@ def main_worker(gpu, ngpus_per_node, args):
                 }, is_best=False, filename='{}/checkpoint_{:04d}_{:.2f}.pth.tar'.format(args.run_dir, epoch, accu))
 
 
-def train(train_loader, model, criterion, optimizer, epoch, niter, args):
+def train(train_loader, model, criterion, sup_criterion, optimizer, epoch, niter, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4f')
+
+    monitor = [batch_time, data_time, losses]
+    if args.celoss_ratio > 0:
+        sup_losses = AverageMeter('CE', ':.4f')
+        accus = AverageMeter('Accu', ':.4f')
+        monitor.append(sup_losses)
+        monitor.append(accus)
+
     progress = ProgressMeter(
         len(train_loader),
-        [batch_time, data_time, losses],
+        monitor,
         prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
     model.train()
 
     end = time.time()
-    for i, (images, _) in enumerate(train_loader):
+    for i, (images, labels) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -365,11 +377,23 @@ def train(train_loader, model, criterion, optimizer, epoch, niter, args):
         # plot_images(images[0], images[1])
 
         # compute output and loss
-        p1, p2, z1, z2 = model(x1=images[0], x2=images[1])
+        p1, p2, z1, z2, logits = model(x1=images[0], x2=images[1])
         model.update(z1, z2)
         loss = -(criterion(p1, z2).mean() + criterion(p2, z1).mean()) * 0.5
-
         losses.update(loss.item(), images[0].size(0))
+
+        # compute supervised loss and accuracy
+        if args.celoss_ratio > 0:
+            assert logits is not None
+            labels = labels.cuda(args.gpu, non_blocking=True)
+            sup_loss = sup_criterion(logits, labels)
+            sup_loss = args.celoss_ratio * sup_loss
+            sup_losses.update(sup_loss.item(), images[0].size(0))
+
+            correct = logits.argmax(dim=-1).eq(labels).float().sum()
+            accu = correct / images[0].size(0)
+            accus.update(accu.item(), images[0].size(0))
+            loss += sup_loss
 
         # compute gradient and do SGD step
         optimizer.zero_grad()

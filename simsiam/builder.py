@@ -19,7 +19,7 @@ class SimSiam(nn.Module):
     """
     Build a SimSiam model.
     """
-    def __init__(self, base_encoder, dim=2048, pred_dim=512, predictor_reg=None, ema=0):
+    def __init__(self, base_encoder, dim=2048, pred_dim=512, ema=0, num_classes=10, predictor_reg=None, sup_branch=False):
         """
         dim: feature dimension (default: 2048)
         pred_dim: hidden dimension of the predictor (default: 512)
@@ -28,24 +28,33 @@ class SimSiam(nn.Module):
 
         # create the encoder
         # num_classes is the output fc dimension, zero-initialize last BNs
-        self.encoder = base_encoder(num_classes=dim, zero_init_residual=True)
+        encoder = base_encoder(num_classes=num_classes, zero_init_residual=True)
+        self.cls = encoder.fc if sup_branch else None
 
-        # build a 3-layer projector
-        prev_dim = self.encoder.fc.weight.shape[1]
-        self.encoder.fc = nn.Sequential(nn.Linear(prev_dim, prev_dim, bias=True),
-                                        nn.BatchNorm1d(prev_dim),
-                                        nn.ReLU(inplace=True), # first layer
-                                        nn.Linear(prev_dim, dim, bias=True))
-                                        # nn.BatchNorm1d(dim, affine=False)) # output layer
-        # self.encoder.fc[-2].bias.requires_grad = False # hack: not use bias as it is followed by BN
+        # Online encoder and projector
+        self.encoder = encoder
+        prev_dim = encoder.fc.weight.shape[1]
+        self.encoder.fc = nn.Identity()
+
+        layers = [nn.Linear(prev_dim, prev_dim, bias=True),
+                  nn.BatchNorm1d(prev_dim),
+                  nn.ReLU(inplace=True), # first layer
+                  nn.Linear(prev_dim, dim, bias=True)]
+        if not predictor_reg: # To have the same projector as BYOL
+            layers[-1].bias.requires_grad = False # hack: not use bias as it is followed by BN
+            layers.append(nn.BatchNorm1d(dim, affine=False))
+        self.projector = nn.Sequential(*layers)
+
+        # Target encoder
         self.ema = ema
         self.target_encoder = copy.deepcopy(self.encoder) if ema > 0 else self.encoder
+        self.target_projector = copy.deepcopy(self.projector) if ema > 0 else self.projector
 
+        # Projector
         if predictor_reg is not None:
             # One-layer predictor for analytical solution
             self.predictor = nn.Linear(dim, dim, bias=False)
         else:
-            # build a 2-layer predictor
             self.predictor = nn.Sequential(nn.Linear(dim, pred_dim, bias=False),
                                             nn.BatchNorm1d(pred_dim),
                                             nn.ReLU(inplace=True), # hidden layer
@@ -59,7 +68,6 @@ class SimSiam(nn.Module):
             for m in self.predictor.parameters():
                 m.requires_grad = False
 
-
     def forward(self, x1, x2):
         """
         Input:
@@ -71,17 +79,27 @@ class SimSiam(nn.Module):
         """
 
         # compute features for one view
-        z1 = self.encoder(x1) # NxC
-        z2 = self.encoder(x2) # NxC
+        f1 = self.encoder(x1) # NxC
+        f2 = self.encoder(x2) # NxC
+
+        z1 = self.projector(f1)
+        z2 = self.projector(f2)
 
         p1 = self.predictor(z1) # NxC
         p2 = self.predictor(z2) # NxC
 
         if self.ema > 0:
-            z1 = self.target_encoder(x1)
-            z2 = self.target_encoder(x2)
+            f1 = self.target_encoder(x1)
+            f2 = self.target_encoder(x2)
+            z1 = self.target_projector(f1)
+            z2 = self.target_projector(f2)
 
-        return p1, p2, z1.detach(), z2.detach()
+        if self.cls is not None:
+            logits = self.cls(f1)
+        else:
+            logits = None
+
+        return p1, p2, z1.detach(), z2.detach(), logits
 
     @torch.no_grad()
     def update_target_network_parameters(self):
@@ -101,7 +119,7 @@ class SimSiam(nn.Module):
             'balance_type': 'boost_scale',
             'dyn_reg': None,
             'dyn_eps_inside': False,
-            'dyn_eps': 0.01,
+            'dyn_eps': 0.1,
             'dyn_convert': 2,
             'dyn_noise': None,
             'predictor_reg': self.predictor_reg
@@ -217,10 +235,7 @@ class SimSiamEncoder(nn.Module):
     """
     def __init__(self, encoder):
         super(SimSiamEncoder, self).__init__()
-        self.encoder = copy.deepcopy(encoder)
-        for m in encoder._modules:
-            setattr(self.encoder, m, getattr(encoder, m))
-        self.encoder.fc = nn.Identity()
+        self.encoder = encoder
 
     def forward(self, x):
         return self.encoder(x)
