@@ -37,23 +37,24 @@ class GaussianBlur(object):
 class SupervisedSimSiamDataset(Dataset):
     def __init__(self, dataset):
         super(SupervisedSimSiamDataset, self).__init__()
-        self.dset = dataset
-        self.transform = self.dset.transform
+        self.classes = dataset.classes
+        self.data, self.targets = dataset.data, dataset.targets
+        self.transform = dataset.transform
 
-        labels = np.array(self.dset.targets)
+        labels = np.array(self.targets)
         self.unique_labels = np.unique(labels)
         self.indices = {
-            label: np.where(self.dset.targets == label)[0] \
+            label: np.where(self.targets == label)[0] \
             for label in self.unique_labels}
 
     def __getitem__(self, index):
-        x1 = self.dset.data[index]
-        y = self.dset.targets[index]
+        x1 = self.data[index]
+        y = self.targets[index]
 
         ind = np.random.choice(self.indices[y], 2, replace=False) # 2 in case selected the same index
         another_index = np.where(ind != index)[0][0] # [0, 1] if no overlap
         another_index = ind[another_index] # ind[0] if no overlap
-        x2 = self.dset.data[another_index]
+        x2 = self.data[another_index]
 
         if self.transform is not None:
             x1, x2 = Image.fromarray(x1), Image.fromarray(x2)
@@ -61,4 +62,4 @@ class SupervisedSimSiamDataset(Dataset):
         return [x1, x2], y
 
     def  __len__(self):
-        return len(self.dset)
+        return len(self.data)
