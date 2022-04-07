@@ -11,6 +11,7 @@ import math
 import os
 import random
 import shutil
+import sys
 import time
 import warnings
 
@@ -27,11 +28,14 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 
+from tensorboardX import SummaryWriter
+from tqdm import tqdm
+
 import simsiam.loader
 import simsiam.builder
 import simsiam.resnet
 
-from utils import plot_images
+from utils import plot_images, create_cl_datasets
 from meter import AverageMeter, ProgressMeter
 
 model_names = sorted(name for name in models.__dict__
@@ -103,6 +107,12 @@ def arguments():
                         help='Experiment name')
     parser.add_argument('--celoss-ratio', default=0., type=float,
                         help='Cross entropy loss ratio to the pipeline')
+    parser.add_argument('--ssl-loss-ratio', default=1., type=float,
+                        help='SSL loss ratio to the pipeline')
+
+    # Continual Learning
+    parser.add_argument('--ntask', default=1, type=int,
+                        help='Number of tasks for incremental learning')
 
     # simsiam specific configs:
     parser.add_argument('--dim', default=2048, type=int,
@@ -119,6 +129,8 @@ def main():
     args.run_dir = os.path.join(args.checkpoint_dir,
                                 args.exp_name if args.exp_name is not None else time.strftime("%Y%m%d_%H%M%S"))
     os.makedirs(args.run_dir, exist_ok=True)
+    torch.save({'args': vars(args), 'command': ' '.join(sys.argv)}, f'{args.run_dir}/args.pt')
+    writer = SummaryWriter(log_dir=args.run_dir)
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -150,10 +162,10 @@ def main():
         mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
     else:
         # Simply call main_worker function
-        main_worker(args.gpu, ngpus_per_node, args)
+        main_worker(args.gpu, ngpus_per_node, writer, args)
 
 
-def main_worker(gpu, ngpus_per_node, args):
+def main_worker(gpu, ngpus_per_node, writer, args):
     args.gpu = gpu
 
     # suppress printing if not master
@@ -263,7 +275,6 @@ def main_worker(gpu, ngpus_per_node, args):
     # Data loading code
     # traindir = os.path.join(args.data, 'train')
     mean, std = [0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010]
-    # mean, std = [0., 0., 0.], [1., 1., 1.]
     normalize = transforms.Normalize(mean=mean, std=std)
 
     # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
@@ -291,28 +302,30 @@ def main_worker(gpu, ngpus_per_node, args):
         transforms.ToTensor(),
         transforms.Normalize(mean, std)])
 
+    # Datasets
     if args.supervised:
-        dset = datasets.CIFAR10(root='./data', train=True, transform=train_transform)
-        train_dataset = simsiam.loader.SupervisedSimSiamDataset(dset)
+        train_dataset = datasets.CIFAR10(root='./data', train=True, transform=train_transform)
     else:
         train_dataset = datasets.CIFAR10(root='./data', train=True,
                                          transform=simsiam.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+    if args.ntask > 1:
+        train_datasets, _, _ = create_cl_datasets(train_dataset, num_task=args.ntask)
+    else:
+        train_datasets = [train_dataset]
+
+    if args.supervised:
+        train_datasets = [simsiam.loader.SupervisedSimSiamDataset(dset) for dset in train_datasets]
 
     train_knn_dataset = datasets.CIFAR10(root='./data', train=True, transform=test_transform)
     test_dataset = datasets.CIFAR10(root='./data', train=False, transform=test_transform)
 
+    # KNN and test Samplers (delay train Sampler to train in case of incremental case)
     if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
         train_knn_sampler = torch.utils.data.distributed.DistributedSampler(train_knn_dataset)
         test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset)
     else:
-        train_sampler = None
         train_knn_sampler = None
         test_sampler = None
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
     train_knn_loader = torch.utils.data.DataLoader(
         train_knn_dataset, batch_size=args.batch_size, shuffle=(train_knn_sampler is None),
@@ -322,30 +335,46 @@ def main_worker(gpu, ngpus_per_node, args):
         test_dataset, batch_size=args.batch_size, shuffle=(test_sampler is None),
         num_workers=4, pin_memory=True, sampler=test_sampler, drop_last=False)
 
+    # Set up epoch progress tracker
+    global_start_epoch = global_epoch = args.start_epoch
+    global_end_epoch = args.epochs * args.ntask
+    start_task = int(global_start_epoch / args.epochs)
+    start_epoch_1st = global_start_epoch % args.epochs
+    start_epochs = [start_epoch_1st] + [0 for _ in range(args.ntask-start_task-1)]
+
     niter = 0
-    for epoch in range(args.start_epoch, args.epochs):
+    for task_i, start_epoch, train_dataset in zip(range(start_task, args.ntask), start_epochs, train_datasets[start_task:]):
         if args.distributed:
-            train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer, init_lr, epoch, args)
+            train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        else:
+            train_sampler = None
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+            num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
-        # train for one epoch
-        niter = train(train_loader, model, criterion, sup_criterion, optimizer, epoch, niter, args)
+        for epoch in range(start_epoch, args.epochs):
+            if args.distributed:
+                train_sampler.set_epoch(epoch)
+            adjust_learning_rate(optimizer, init_lr, global_epoch, args)
 
-        if (epoch > 0 and epoch % args.eval_period == 0) or epoch == args.epochs-1:
-            # accu = test(train_knn_loader, train_knn_loader, encoder, epoch, args)
-            accu = test(train_knn_loader, test_loader, encoder, epoch, args)
+            # train for one epoch
+            niter = train(train_loader, model, criterion, sup_criterion, optimizer, global_epoch, niter, writer, args)
 
-            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                    and args.rank % ngpus_per_node == 0):
-                save_checkpoint({
-                    'epoch': epoch + 1,
-                    'arch': args.arch,
-                    'state_dict': model.state_dict(),
-                    'optimizer' : optimizer.state_dict(),
-                }, is_best=False, filename='{}/checkpoint_{:04d}_{:.2f}.pth.tar'.format(args.run_dir, epoch, accu))
+            if (epoch > 0 and global_epoch % args.eval_period == 0) or epoch == args.epochs-1:
+                accu, _, _ = test(train_knn_loader, test_loader, encoder, global_epoch, niter, args, writer=writer)
+
+                if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                        and args.rank % ngpus_per_node == 0):
+                    save_checkpoint({
+                        'epoch': global_epoch + 1,
+                        'arch': args.arch,
+                        'state_dict': model.state_dict(),
+                        'optimizer' : optimizer.state_dict(),
+                    }, is_best=False, filename='{}/checkpoint_{:04d}_{:.2f}.pth.tar'.format(args.run_dir, global_epoch, accu))
+            global_epoch += 1
 
 
-def train(train_loader, model, criterion, sup_criterion, optimizer, epoch, niter, args):
+def train(train_loader, model, criterion, sup_criterion, optimizer, epoch, niter, writer, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4f')
@@ -378,9 +407,16 @@ def train(train_loader, model, criterion, sup_criterion, optimizer, epoch, niter
 
         # compute output and loss
         p1, p2, z1, z2, logits = model(x1=images[0], x2=images[1])
-        model.update(z1, z2)
-        loss = -(criterion(p1, z2).mean() + criterion(p2, z1).mean()) * 0.5
-        losses.update(loss.item(), images[0].size(0))
+
+        loss = 0.
+        if args.ssl_loss_ratio > 0:
+            model.update(z1, z2)
+            ssl_loss = -(criterion(p1, z2).mean() + criterion(p2, z1).mean()) * 0.5
+            loss += ssl_loss
+            losses.update(loss.item(), images[0].size(0))
+            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                    and args.rank % ngpus_per_node == 0):
+                writer.add_scalar('Loss/train/SSL_loss', ssl_loss, niter)
 
         # compute supervised loss and accuracy
         if args.celoss_ratio > 0:
@@ -394,14 +430,19 @@ def train(train_loader, model, criterion, sup_criterion, optimizer, epoch, niter
             accu = correct / images[0].size(0)
             accus.update(accu.item(), images[0].size(0))
             loss += sup_loss
+            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                    and args.rank % ngpus_per_node == 0):
+                writer.add_scalar('Loss/train/SUP_loss', sup_loss, niter)
+                writer.add_scalar('Accuracy/train', accu, niter)
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        model.regulate_predictor(niter, epoch_start=False)
-        model.update_target_network_parameters()
+        if args.ssl_loss_ratio > 0:
+            model.regulate_predictor(niter, epoch_start=False)
+            model.update_target_network_parameters()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -463,7 +504,7 @@ def get_features(loader, encoder, args):
     return features, labels
 
 
-def test(train_knn_loader, test_loader, encoder, epoch, args, knn_k=25, knn_t=0.1):
+def test(train_knn_loader, test_loader, encoder, epoch, niter, args, knn_k=25, knn_t=0.1, writer=None):
     with torch.no_grad():
         classes = len(train_knn_loader.dataset.classes)
 
@@ -503,8 +544,13 @@ def test(train_knn_loader, test_loader, encoder, epoch, args, knn_k=25, knn_t=0.
         print(f'{cls}: {correct/total} ({correct}/{total})', end='; ')
     correct, total = cls_correct['all'], cls_total['all']
     accu = correct/total
+
+    if (not args.multiprocessing_distributed or (args.multiprocessing_distributed
+            and args.rank % ngpus_per_node == 0)) and writer is not None:
+        writer.add_scalar('Accuracy/test', accu, niter)
+
     print(f'\nAVG: {accu:.4f} ({correct}/{total})')
-    return accu
+    return accu, cls_correct, cls_total
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
