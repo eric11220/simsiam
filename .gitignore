@@ -1,0 +1,12 @@
+*.tar
+
+__pycache__
+
+checkpoints/
+lincls_checkpoints/
+not_used/
+plotting/
+data
+
+parse_accu_hist.py
+utils.py
