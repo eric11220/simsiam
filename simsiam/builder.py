@@ -36,11 +36,12 @@ class SimSiam(nn.Module):
         prev_dim = encoder.fc.weight.shape[1]
         self.encoder.fc = nn.Identity()
 
-        layers = [nn.Linear(prev_dim, prev_dim, bias=True),
+        # To have the same projector as BYOL
+        layers = [nn.Linear(prev_dim, prev_dim, bias=False), #NOTE: BYOL has bias here
                   nn.BatchNorm1d(prev_dim),
                   nn.ReLU(inplace=True), # first layer
                   nn.Linear(prev_dim, dim, bias=True)]
-        if not predictor_reg: # To have the same projector as BYOL
+        if not predictor_reg:
             layers[-1].bias.requires_grad = False # hack: not use bias as it is followed by BN
             layers.append(nn.BatchNorm1d(dim, affine=False))
         self.projector = nn.Sequential(*layers)
@@ -89,10 +90,10 @@ class SimSiam(nn.Module):
         p2 = self.predictor(z2) # NxC
 
         if self.ema > 0:
-            f1 = self.target_encoder(x1)
-            f2 = self.target_encoder(x2)
-            z1 = self.target_projector(f1)
-            z2 = self.target_projector(f2)
+            t1 = self.target_encoder(x1)
+            t2 = self.target_encoder(x2)
+            z1 = self.target_projector(t1)
+            z2 = self.target_projector(t2)
 
         if self.cls is not None:
             logits = self.cls(f1)
@@ -119,7 +120,7 @@ class SimSiam(nn.Module):
             'balance_type': 'boost_scale',
             'dyn_reg': None,
             'dyn_eps_inside': False,
-            'dyn_eps': 0.1,
+            'dyn_eps': 0.01,
             'dyn_convert': 2,
             'dyn_noise': None,
             'predictor_reg': self.predictor_reg
